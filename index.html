@@ -427,21 +427,22 @@ let CU = null;
 let CURMOD = 'ae';
 
 // ═══════════════════════════════════════════════════════════════
-// CLOUD STORAGE ENGINE — JSONBin.io (Free, No Server Needed)
+// CLOUD STORAGE ENGINE — Google Apps Script (No CORS, Free)
 // ═══════════════════════════════════════════════════════════════
-// SETUP (one-time, 2 minutes):
-//  1. Go to https://jsonbin.io → Sign Up Free
-//  2. Dashboard → API Keys → Create → copy your key
-//  3. Click "New Bin" → paste {} → Save → copy the Bin ID from URL
-//  4. Paste both below, redeploy/upload your HTML file
+// SETUP (one-time, ~5 minutes):
+//  1. Go to https://script.google.com → New Project
+//  2. Delete all existing code and paste the Apps Script code
+//     provided in the setup instructions
+//  3. Click Deploy → New Deployment → Web App
+//     - Execute as: Me
+//     - Who has access: Anyone
+//  4. Copy the Web App URL and paste below
 // ═══════════════════════════════════════════════════════════════
 const CLOUD_CFG = {
-  BIN_ID:  '6a1b434b21f9ee59d29ecd13',   // e.g. '6654a1e7acd3cb34a8497c2e'
-  API_KEY: '$2a$10$2NJBqjZA3a72askyaRi2R.ZaaGpyENtUglYVU7B0mO10r0vpQW1im',  // e.g. '$2a$10$abc...'
-  BASE:    'https://api.jsonbin.io/v3/b',
+  SCRIPT_URL: 'https://script.google.com/macros/s/AKfycbz5uz9Z55zvFWTmA4LsejJtXaI1xukIPKGZ48q9GNQvSKupRKT5RFrEzNlMvFceF8bG/exec',
 };
 
-const CONFIGURED = !CLOUD_CFG.BIN_ID.includes('PASTE') && !CLOUD_CFG.API_KEY.includes('PASTE');
+const CONFIGURED = !CLOUD_CFG.SCRIPT_URL.includes('PASTE');
 let   SYNC_TIMER  = null;
 let   PENDING_SAVE = false;
 let   CLOUD_LOADED = false;
@@ -478,16 +479,75 @@ function showShellSync(state, msg) {
 function saveLocal() { try{localStorage.setItem('t21_unified',JSON.stringify(DB));}catch(e){} }
 function loadLocal() { try{const d=localStorage.getItem('t21_unified');if(d)DB=JSON.parse(d);}catch(e){} }
 
+// ── Google Apps Script fetch ─────────────────────────────────────
+// Apps Script Web Apps don't send CORS headers, so we use these tricks:
+//   LOAD — JSONP-style via a <script> tag (bypasses CORS entirely)
+//   SAVE — fetch with mode:'no-cors' + text/plain body (fire-and-forget)
+
+function gasLoad() {
+  return new Promise((resolve, reject) => {
+    const cbName = '__t21cb_' + Date.now();
+    const url = CLOUD_CFG.SCRIPT_URL + '?action=load&callback=' + cbName;
+    const script = document.createElement('script');
+    const timer = setTimeout(() => {
+      delete window[cbName];
+      script.remove();
+      // Fallback: try plain fetch (works when hosted on same origin or CORS allowed)
+      fetch(CLOUD_CFG.SCRIPT_URL + '?action=load')
+        .then(r => r.json())
+        .then(resolve)
+        .catch(reject);
+    }, 8000);
+    window[cbName] = (data) => {
+      clearTimeout(timer);
+      delete window[cbName];
+      script.remove();
+      resolve(data);
+    };
+    script.onerror = () => {
+      clearTimeout(timer);
+      delete window[cbName];
+      script.remove();
+      // Fallback to plain fetch
+      fetch(CLOUD_CFG.SCRIPT_URL + '?action=load')
+        .then(r => r.json())
+        .then(resolve)
+        .catch(reject);
+    };
+    script.src = url;
+    document.head.appendChild(script);
+  });
+}
+
+async function gasSave(data) {
+  // no-cors POST — fire and forget, Apps Script receives it via doPost
+  try {
+    await fetch(CLOUD_CFG.SCRIPT_URL, {
+      method: 'POST',
+      mode: 'no-cors',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ action: 'save', data })
+    });
+  } catch(e) { /* no-cors fetch always "succeeds" — errors are silent */ }
+}
+
+async function gasRequest(action, data) {
+  if (action === 'load') {
+    return await gasLoad();
+  } else {
+    await gasSave(data);
+    return { ok: true };
+  }
+}
+
 async function loadCloud() {
   if (!CONFIGURED) { loadLocal(); CLOUD_LOADED=true; return; }
   showSyncBadge('loading','⟳ Loading shared data…');
   try {
-    const r = await fetch(`${CLOUD_CFG.BASE}/${CLOUD_CFG.BIN_ID}/latest`,{
-      headers:{'X-Master-Key':CLOUD_CFG.API_KEY}
-    });
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    const json = await r.json();
-    DB = Object.assign({}, DB, json.record||{});
+    const json = await gasRequest('load');
+    if(json && json.data) {
+      DB = Object.assign({}, DB, json.data);
+    }
     saveLocal();
     showSyncBadge('ok','☁ Cloud connected — all devices share one database');
     CLOUD_LOADED = true;
@@ -495,43 +555,41 @@ async function loadCloud() {
     loadLocal(); CLOUD_LOADED=true;
     showSyncBadge(CONFIGURED?'error':'local',
       CONFIGURED ? '⚠ Cloud error, using local backup: '+e.message
-                 : '⚠ LOCAL MODE — data only saves on this device. Configure JSONBin to sync.');
+                 : '⚠ LOCAL MODE — data only saves on this device. Set up Google Apps Script to sync.');
   }
 }
 
 async function pushCloud() {
-  if(!CONFIGURED){saveLocal();return;}
+  if(!CONFIGURED){ saveLocal(); return; }
   saveLocal(); PENDING_SAVE=true;
   clearTimeout(SYNC_TIMER);
   SYNC_TIMER = setTimeout(async()=>{
     if(!PENDING_SAVE) return; PENDING_SAVE=false;
     showShellSync('saving','⟳ Saving…');
     try {
-      const r = await fetch(`${CLOUD_CFG.BASE}/${CLOUD_CFG.BIN_ID}`,{
-        method:'PUT',
-        headers:{'Content-Type':'application/json','X-Master-Key':CLOUD_CFG.API_KEY,'X-Bin-Versioning':'false'},
-        body:JSON.stringify(DB)
-      });
-      if(!r.ok) throw new Error('HTTP '+r.status);
+      await gasRequest('save', DB);
       showShellSync('ok','✓ Synced');
       setTimeout(()=>showShellSync('ok','☁ Cloud'),2500);
-    } catch(e) { showShellSync('error','⚠ Sync failed — will retry'); PENDING_SAVE=true; }
-  },1500);
+    } catch(e) {
+      showShellSync('error','⚠ Sync failed — will retry');
+      PENDING_SAVE=true;
+    }
+  }, 1500);
 }
 
 function startPolling(){
   if(!CONFIGURED) return; stopPolling();
   POLL_TIMER = setInterval(async()=>{
     try{
-      const r=await fetch(`${CLOUD_CFG.BASE}/${CLOUD_CFG.BIN_ID}/latest`,{headers:{'X-Master-Key':CLOUD_CFG.API_KEY}});
-      if(!r.ok) return;
-      const json=await r.json(); const remote=json.record||{};
-      const myData=CU?DB[CU]:null;
-      DB=Object.assign({},remote,myData&&CU?{[CU]:myData}:{});
+      const json = await gasRequest('load');
+      if(!json || !json.data) return;
+      const remote = json.data;
+      const myData = CU ? DB[CU] : null;
+      DB = Object.assign({}, remote, myData && CU ? {[CU]: myData} : {});
       saveLocal();
       if(CU){const acc=getACC()[CU];if(acc){if(acc.role==='client')updateAENavPcts();else if(acc.role==='team')update360NavPcts();}}
     }catch(e){}
-  },30000);
+  }, 30000);
 }
 function stopPolling(){ clearInterval(POLL_TIMER); POLL_TIMER=null; }
 
@@ -542,7 +600,7 @@ function loadDB(){}
   loadLocal();
   await loadCloud();
   if(!CONFIGURED){
-    showSyncBadge('local','⚠ LOCAL ONLY MODE — Data stays on this device only. See CLOUD STORAGE SETUP above to enable cross-device sync.');
+    showSyncBadge('local','⚠ LOCAL ONLY MODE — Data stays on this device only. Set SCRIPT_URL to enable cross-device sync.');
   }
 })();
 
